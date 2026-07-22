@@ -1,0 +1,44 @@
+# Template for config.yaml. `install.sh` copies this to config.yaml and substitutes __AGENT_DIR__,
+# __WORKSPACE__, and __AGENT_NAME__. config.yaml is git-ignored (host-specific paths). To edit by
+# hand instead: `cp config.example.yaml config.yaml` and replace the __PLACEHOLDER__ values.
+broker:
+  host: rabbitmq.tech.cgholdings.internal   # created by the cluster session (private DNS, over VPN)
+  port: 5671                                 # amqps (TLS). Use 5672 only if TLS disabled.
+  tls: true
+  tls_verify: true                           # keep ON — the broker cert is a real SAN cert
+  # CA is rendered + kept fresh by Vault Agent (from secret/platform/ca-cert). Used for RabbitMQ TLS.
+  tls_ca_file: __AGENT_DIR__/vault/platform-ca.crt
+  vhost: /mobile
+  username: mac-agent      # overridden by env RABBIT_USER (Vault Agent -> vault/rabbitmq.env)
+  password: ""            # overridden by env RABBIT_PASS (Vault Agent -> vault/rabbitmq.env)
+  heartbeat: 60
+
+queues:
+  jobs: mobile.builds              # queue this agent consumes
+  status_exchange: mobile.status   # exchange status is published to (routing key = job_id)
+
+agent:
+  name: __AGENT_NAME__             # unique per Mac; shown in RabbitMQ mgmt UI + status msgs
+  workspace: __WORKSPACE__
+  keep_jobs: 5                     # how many recent per-job dirs (logs/artifacts) to retain
+  prefetch: 2                      # concurrent builds = concurrent VMs (Apple's hard cap is 2/host)
+
+vm:
+  tart_bin: /opt/homebrew/bin/tart
+  base_image: mobile-builder-base # built by provision-base-image.sh from a Cirrus Xcode image
+  cpus: 5                          # 2 concurrent VMs -> 10 vCPU, leaves headroom on a 12-core host
+  memory_gb: 18                    # 2 concurrent VMs -> 36 GB, leaves ~12 GB on a 48 GB host
+  boot_timeout_sec: 180           # wait for VM IP + SSH after boot
+  max_job_seconds: 3600           # hard-kill a build (VM torn down) after this
+  ssh_user: admin                 # Cirrus macOS images default to admin/admin
+  ssh_password: admin
+
+# Vault access passed INTO the build VM. The mobile-app Fastfiles read signing/publish creds from
+# Vault themselves (load_vault_secrets), so the agent only forwards VAULT_ADDR + the current token.
+# Requires the VM to reach Vault — via the scoped pf bridge (see GO-LIVE.md / bridge-vault.pf).
+vault_bridge:
+  addr: https://vault.tech.cgholdings.internal
+  token_file: /Users/tech/mobile-build-agent/vault/token   # Vault Agent's token sink
+
+git:
+  ssh_key: ""                     # optional SSH deploy key; only used if a job carries no github_token

@@ -1,0 +1,47 @@
+# Vault Agent config — runs under launchd (com.cgholdings.vault-agent), authenticates via AppRole,
+# renews its own token, and renders the CA + secrets to disk, refreshing them on rotation.
+# The build agent (com.cgholdings.buildagent) reads what this renders; it never talks to Vault.
+#
+# TEMPLATE: install.sh renders __AGENT_DIR__ -> the clone location, producing vault-agent.hcl.
+#
+# Seeded once before first start (install.sh does the CA copy; you provide the AppRole creds):
+#   secrets/vault_role_id    <- AppRole role_id
+#   secrets/vault_secret_id  <- AppRole secret_id (unwrapped from the response-wrapped token)
+#   vault/platform-ca.crt    <- platform-ca root, to bootstrap TLS to Vault (self-maintained after)
+
+vault {
+  address = "https://vault.tech.cgholdings.internal"
+  ca_cert = "__AGENT_DIR__/vault/platform-ca.crt"
+}
+
+auto_auth {
+  method "approle" {
+    config = {
+      role_id_file_path                   = "__AGENT_DIR__/secrets/vault_role_id"
+      secret_id_file_path                 = "__AGENT_DIR__/secrets/vault_secret_id"
+      remove_secret_id_file_after_reading = false
+    }
+  }
+  sink "file" {
+    config = { path = "__AGENT_DIR__/vault/token" }
+  }
+}
+
+# --- Internal CA (bootstraps + keeps TLS trust for both Vault and RabbitMQ) ---
+template {
+  contents    = "{{ with secret \"secret/data/platform/ca-cert\" }}{{ index .Data.data \"ca.crt\" }}{{ end }}"
+  destination = "__AGENT_DIR__/vault/platform-ca.crt"
+}
+
+# --- RabbitMQ creds -> env file; bounce the build agent when they change ---
+template {
+  contents    = "{{ with secret \"secret/data/cicd/mobile-app/rabbitmq\" }}RABBIT_USER={{ .Data.data.username }}\nRABBIT_PASS={{ .Data.data.password }}\n{{ end }}"
+  destination = "__AGENT_DIR__/vault/rabbitmq.env"
+  # array + sh -c so $(id -u) expands; `|| true` so it's a no-op when the agent isn't loaded yet
+  command     = ["/bin/sh", "-c", "launchctl kickstart -k gui/$(id -u)/com.cgholdings.buildagent || true"]
+}
+
+# NOTE: publish/signing creds are NOT rendered here. The mobile-app Fastfiles read them from Vault
+# directly inside the VM (before_all -> load_vault_secrets), using VAULT_ADDR + the VAULT_TOKEN the
+# host injects into the job. The token sink above is what the host passes through. This keeps signing
+# secrets off the host disk entirely.

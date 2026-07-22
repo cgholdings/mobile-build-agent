@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchAgent for Vault Agent: authenticates via AppRole, renews its token, and renders the CA
+     + secrets that the build agent consumes. Install to ~/Library/LaunchAgents and load in gui.
+     TEMPLATE: install.sh renders __AGENT_DIR__ -> the clone location. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cgholdings.vault-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/vault</string>
+    <string>agent</string>
+    <string>-config=__AGENT_DIR__/vault-agent.hcl</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__AGENT_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__AGENT_DIR__/logs/vault-agent.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__AGENT_DIR__/logs/vault-agent.err.log</string>
+</dict>
+</plist>

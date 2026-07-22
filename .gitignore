@@ -1,0 +1,25 @@
+# ---- secrets & runtime-rendered (NEVER commit) ----
+# config.yaml: host-specific paths, rendered from config.example.yaml
+config.yaml
+# vault-agent.hcl: rendered from vault-agent.hcl.tmpl
+vault-agent.hcl
+# rendered LaunchAgent/Daemon plists (from *.plist.tmpl)
+com.cgholdings.buildagent.plist
+com.cgholdings.vault-agent.plist
+com.cgholdings.vault-bridge.plist
+# AppRole role_id / secret_id
+secrets/
+# Vault-Agent-rendered token, rabbitmq.env, live CA
+vault/
+*.pem
+*.p8
+*.jks
+
+# ---- host-local / generated ----
+.venv/
+logs/
+build-workspace/
+scratch/
+__pycache__/
+*.pyc
+start-agent.sh.log

@@ -1,0 +1,11 @@
+# Scoped VM->Vault network bridge (pf anchor).
+#
+# Ephemeral Tart build VMs (192.168.64.0/24) need to reach the internal Vault so the mobile-app
+# Fastfiles can read signing creds. Vault is VPN-only (utun4, host VPN IP 10.8.0.13). IP forwarding
+# is already on and the host routes 10.10/16 -> utun4; the only missing piece is source-NAT so
+# Vault's replies return. This NATs ONLY Vault's IPs — every other internal host stays unreachable
+# from VMs (no NAT rule -> no return path), so the exposure is limited to Vault.
+#
+# Vault currently resolves to 10.10.2.142 and 10.10.3.165 (LoadBalancer). If those change, update here.
+
+nat on utun4 inet from 192.168.64.0/24 to { 10.10.2.142, 10.10.3.165 } -> (utun4)

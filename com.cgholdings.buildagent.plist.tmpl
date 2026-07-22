@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchAgent (NOT a LaunchDaemon): Tart uses Virtualization.framework, which requires a
+     logged-in user GUI session. Install to ~/Library/LaunchAgents and load in the gui domain.
+     The Mac must be logged in (enable auto-login) for builds to run headless.
+     TEMPLATE: install.sh renders __AGENT_DIR__ -> the clone location. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cgholdings.buildagent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__AGENT_DIR__/start-agent.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__AGENT_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__AGENT_DIR__/logs/agent.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__AGENT_DIR__/logs/agent.err.log</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>
