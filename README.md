@@ -133,13 +133,23 @@ all consuming the same `mobile.builds` queue (RabbitMQ load-balances).
 
 ## Troubleshooting
 
+**Start here — `make repair`.** It checks and fixes the whole chain in dependency order (VPN → pf
+bridge → Vault Agent → an end-to-end VM→Vault probe → build agent), restarting each service cleanly
+and refusing to run mid-build unless you pass `FORCE=1`. It is idempotent, so it doubles as a
+diagnosis tool. Use `SKIP_VM=1` to skip the ~2 min probe VM.
+
 - **Agent won't connect**: VPN up (`ifconfig | grep utun`); `nc -vz rabbitmq.tech.cgholdings.internal 5671`;
   `cat vault/rabbitmq.env` (should have RABBIT_USER/PASS); `tail logs/agent.err.log`.
 - **Vault Agent errors**: `make logs-vault`; check `secrets/vault_secret_id` is valid (unwrap a fresh one);
   ensure `vault/platform-ca.crt` exists.
 - **VM never gets an IP**: must be in a GUI login session (auto-login on, not just SSH); `tart list`;
   try `make scratch`.
-- **Build VM can't reach Vault**: install the pf bridge (`make bridge-install`); `make bridge-status`.
+- **Build VM can't reach Vault** (`Net::OpenTimeout ... vault.tech.cgholdings.internal:443` in the
+  build log, while the *host* reaches Vault fine): the pf bridge is down. Run `make bridge-status` —
+  if it says `anchor referenced: NO`, `/etc/pf.conf` lost its `nat-anchor "cgh-vault-bridge"` line,
+  which a **macOS update does silently** by resetting the file to stock. pf never evaluates an
+  unreferenced anchor, so the NAT rule loads "successfully" and does nothing. Fix: `make repair`
+  (or just `make bridge-anchor`). The bridge daemon also self-heals this within 30s of noticing.
 - **No live logs in Argo**: build output must reach `vm-build.sh`'s stdout — its `run()` helper `tee`s
   to both stdout (streamed) and `build.log`. Per-job stream is also saved to
   `build-workspace/<job_id>/out/stream.log`.

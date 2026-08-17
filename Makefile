@@ -26,7 +26,7 @@ VAULT_ADDR_ := https://vault.tech.cgholdings.internal
 .PHONY: help deps image firebase-cli secret-id config install uninstall \
         start stop restart start-vault status logs logs-vault logs-fb verify reachability \
         bake-versions bake-android harden-all harden-filevault harden-autologin harden-power \
-        bridge-install bridge-status bridge-uninstall scratch scratch-clean clean
+        repair bridge-install bridge-anchor bridge-status bridge-uninstall scratch scratch-clean clean
 
 help: ## Show this help
 	@echo "mobile-build-agent — make targets:"; echo
@@ -34,6 +34,7 @@ help: ## Show this help
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n",$$1,$$2}'
 	@echo; echo "First-time (no sudo):  make deps image install start verify"
 	@echo "Headless auto-start:   make harden-all   (needs sudo — see GO-LIVE.md step 2-4)"
+	@echo "Builds failing?:       make repair       (checks + fixes the whole chain, in order)"
 
 # ---- one-time setup -----------------------------------------------------------
 deps: ## Create the Python venv and install dependencies
@@ -138,16 +139,26 @@ harden-power: ## Never sleep + auto-restart after outage/hang
 	sudo pmset -a autorestart 1
 	-sudo systemsetup -setrestartfreeze on
 
+# ---- repair (SUDO) ------------------------------------------------------------
+repair: ## Check + fix the whole chain (VPN, pf bridge, Vault Agent, VM path, build agent) and restart it cleanly in order
+	@bash $(AGENT_DIR)/repair.sh
+
 # ---- VM->Vault pf bridge (SUDO; persists across reboot) -----------------------
-bridge-install: ## Install the pf VM->Vault bridge LaunchDaemon (root, RunAtLoad)
+bridge-install: bridge-anchor ## Install the pf VM->Vault bridge LaunchDaemon (root, RunAtLoad)
 	$(RENDER) $(AGENT_DIR)/com.cgholdings.vault-bridge.plist.tmpl > /tmp/com.cgholdings.vault-bridge.plist
 	sudo cp /tmp/com.cgholdings.vault-bridge.plist /Library/LaunchDaemons/
 	sudo chown root:wheel /Library/LaunchDaemons/com.cgholdings.vault-bridge.plist
 	sudo chmod 644 /Library/LaunchDaemons/com.cgholdings.vault-bridge.plist
 	-sudo launchctl bootout system/com.cgholdings.vault-bridge 2>/dev/null
 	sudo launchctl bootstrap system /Library/LaunchDaemons/com.cgholdings.vault-bridge.plist
-	@sleep 2 && $(MAKE) -s bridge-status
-bridge-status: ## Show the live VM->Vault NAT rules + daemon log
+	@sleep 5 && $(MAKE) -s bridge-status
+bridge-anchor: ## Ensure /etc/pf.conf references the bridge anchor (idempotent; an OS update wipes it)
+	@sudo bash $(AGENT_DIR)/bridge-vault.sh --ensure-anchor
+bridge-status: ## Show whether pf actually evaluates the bridge, plus the live rules + daemon log
+	@sudo pfctl -s nat 2>/dev/null | grep -q '"cgh-vault-bridge"' \
+	  && echo "anchor referenced: yes" \
+	  || echo "anchor referenced: NO   <- pf is IGNORING the rule below (make repair)"
+	@sudo pfctl -s info 2>/dev/null | grep '^Status:' | sed 's/^/pf /' || true
 	@sudo pfctl -a cgh-vault-bridge -s nat 2>/dev/null || echo "(anchor empty / pf off)"
 	@tail -3 /var/log/cgh-vault-bridge.log 2>/dev/null || echo "(no daemon log yet)"
 bridge-uninstall: ## Remove the bridge daemon (NAT rules clear on next pf reload/reboot)
