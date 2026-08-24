@@ -26,7 +26,8 @@ VAULT_ADDR_ := https://vault.tech.cgholdings.internal
 .PHONY: help deps image firebase-cli secret-id config install uninstall \
         start stop restart start-vault status logs logs-vault logs-fb verify reachability \
         bake-versions bake-android harden-all harden-filevault harden-autologin harden-power \
-        repair bridge-install bridge-anchor bridge-status bridge-uninstall scratch scratch-clean clean
+        repair cert-status cert-seed bridge-install bridge-anchor bridge-status bridge-uninstall \
+        scratch scratch-clean clean
 
 help: ## Show this help
 	@echo "mobile-build-agent — make targets:"; echo
@@ -140,8 +141,16 @@ harden-power: ## Never sleep + auto-restart after outage/hang
 	-sudo systemsetup -setrestartfreeze on
 
 # ---- repair (SUDO) ------------------------------------------------------------
-repair: ## Check + fix the whole chain (VPN, pf bridge, Vault Agent, VM path, build agent) and restart it cleanly in order
+repair: ## Check + fix the whole chain (VPN, pf bridge, Vault Agent, certs, VM path, build agent) and restart it cleanly in order
 	@bash $(AGENT_DIR)/repair.sh
+
+# ---- internal TLS / platform CA -----------------------------------------------
+cert-status: ## Show platform-CA expiry + whether Vault's cert verifies (no sudo, changes nothing). WARN_DAYS=30
+	@bash $(AGENT_DIR)/cert-status.sh
+cert-seed: ## Refresh the git-tracked bootstrap CA from the Vault-rendered one (commit the result)
+	@test -s $(AGENT_DIR)/vault/platform-ca.crt || { echo "vault/platform-ca.crt missing — is Vault Agent running?"; exit 1; }
+	@printf '%s\n' "$$(cat $(AGENT_DIR)/vault/platform-ca.crt)" > $(AGENT_DIR)/platform-ca.crt
+	@echo "seeded platform-ca.crt from the runtime CA:"; $(MAKE) -s cert-status
 
 # ---- VM->Vault pf bridge (SUDO; persists across reboot) -----------------------
 bridge-install: bridge-anchor ## Install the pf VM->Vault bridge LaunchDaemon (root, RunAtLoad)

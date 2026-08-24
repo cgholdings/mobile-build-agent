@@ -7,8 +7,9 @@
 #   1. VPN          the host must reach Vault and the broker at all
 #   2. pf bridge    /etc/pf.conf anchor reference + the NAT rule, so *VMs* can reach Vault
 #   3. Vault Agent  authenticates, renders the CA + RabbitMQ creds the build agent reads
-#   4. VM check     proves the VM->Vault path end to end — no static check on the host can
-#   5. build agent  consumes the rendered creds; stopped first, started last
+#   4. platform CA  the rendered trust anchor actually verifies Vault, and is not about to lapse
+#   5. VM check     proves the VM->Vault path end to end — no static check on the host can
+#   6. build agent  consumes the rendered creds; stopped first, started last
 #
 # Usage:  make repair              full run (prompts for sudo at step 2)
 #         make repair FORCE=1      proceed even if builds are in flight (they get killed)
@@ -65,7 +66,7 @@ token_is_fresh()   { [ "$(stat -f %m "$HERE/vault/token" 2>/dev/null || echo 0)"
 agent_online()     { tail -5 "$HERE/logs/agent.out.log" 2>/dev/null | grep -q 'Agent online'; }
 
 # ---- 1. VPN -------------------------------------------------------------------------------
-step "1/6  VPN reachability (host)"
+step "1/7  VPN reachability (host)"
 if nc -z -G 6 "$VAULT_HOST" 443 >/dev/null 2>&1; then
   ok "$VAULT_HOST:443 reachable"
 else
@@ -95,7 +96,7 @@ fi
 # ---- 2. pf bridge (SUDO) ------------------------------------------------------------------
 # The failure this whole script exists for: /etc/pf.conf gets reset to stock by a macOS update and
 # loses the anchor reference. The rule still loads into the anchor, pf just never evaluates it.
-step "2/6  pf VM->Vault bridge  (needs sudo)"
+step "2/7  pf VM->Vault bridge  (needs sudo)"
 sudo -v || die "sudo is required to inspect and load pf rules"
 
 # Delegated to the daemon script's one-shot mode so the pf-editing logic exists in one place only.
@@ -111,7 +112,7 @@ sudo pfctl -s info 2>/dev/null | grep -q '^Status: Enabled' \
   || { info "pf was disabled — enabling"; sudo pfctl -e 2>/dev/null; }
 
 # ---- 3. bridge daemon ----------------------------------------------------------------------
-step "3/6  bridge daemon ($BRIDGE_SVC)"
+step "3/7  bridge daemon ($BRIDGE_SVC)"
 if [ ! -f "$DAEMON_PLIST" ]; then
   warn "daemon not installed — installing"
   sed -e "s|__AGENT_DIR__|$HERE|g" "$HERE/$BRIDGE_SVC.plist.tmpl" > "/tmp/$BRIDGE_SVC.plist"
@@ -137,7 +138,7 @@ else
 fi
 
 # ---- 4. stop the build agent cleanly --------------------------------------------------------
-step "4/6  stopping the build agent"
+step "4/7  stopping the build agent"
 if launchctl list | grep -q "$BUILD_SVC"; then
   # The agent handles SIGTERM by finishing its current job first, so give it room before we move on.
   launchctl bootout "$GUI/$BUILD_SVC" 2>/dev/null
@@ -146,7 +147,7 @@ fi
 build_agent_stopped && ok "build agent stopped" || warn "build agent process still alive — continuing anyway"
 
 # ---- 5. Vault Agent -------------------------------------------------------------------------
-step "5/6  Vault Agent ($VAULT_SVC)"
+step "5/7  Vault Agent ($VAULT_SVC)"
 TOKEN_MTIME_BEFORE=$(stat -f %m "$HERE/vault/token" 2>/dev/null || echo 0)
 if launchctl list | grep -q "$VAULT_SVC"; then
   launchctl kickstart -k "$GUI/$VAULT_SVC"
@@ -163,16 +164,26 @@ for f in vault/token vault/platform-ca.crt vault/rabbitmq.env; do
   [ -s "$HERE/$f" ] && ok "rendered $f" || bad "missing/empty $f — see logs/vault-agent.err.log"
 done
 
-# ---- 6. end-to-end VM check -----------------------------------------------------------------
+# ---- 6. platform CA / internal TLS trust -----------------------------------------------------
+# Runs AFTER Vault Agent so we are looking at freshly rendered trust. Delegated to cert-status.sh
+# so `make cert-status` and this step can never drift apart.
+step "6/7  platform CA / internal TLS trust"
+if bash "$HERE/cert-status.sh"; then
+  :
+else
+  bad "platform CA problem — see the FAIL lines above"
+fi
+
+# ---- 7. end-to-end VM check -----------------------------------------------------------------
 # The one check that would have caught the outage: everything on the host looks healthy when the
 # anchor is unreferenced, because the host reaches Vault directly and never needs the NAT.
 if [ "$SKIP_VM" = 1 ]; then
-  step "6/6  VM->Vault check  (skipped: SKIP_VM=1)"
+  step "7/7  VM->Vault check  (skipped: SKIP_VM=1)"
 elif ! tart list 2>/dev/null | grep -q mobile-builder-base; then
-  step "6/6  VM->Vault check"
+  step "7/7  VM->Vault check"
   warn "base image 'mobile-builder-base' missing — skipping (make image)"
 else
-  step "6/6  VM->Vault check  (boots a throwaway VM, ~2 min)"
+  step "7/7  VM->Vault check  (boots a throwaway VM, ~2 min)"
   # 'verify-' prefix so a stranded probe is swept up by `make clean`.
   probe="verify-vault-$$"
   cleanup_probe() { tart stop "$probe" >/dev/null 2>&1; sleep 1; tart delete "$probe" >/dev/null 2>&1; }

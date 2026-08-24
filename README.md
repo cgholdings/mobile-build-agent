@@ -79,6 +79,8 @@ The agent is "visible" (Argo has no node registry) when it shows up as a **consu
 | `make bake-android API=35 BT=35.0.0` | bake an Android SDK platform + build-tools into the image |
 | `make secret-id WRAP=hvs.xxxx` | unwrap a fresh AppRole `secret_id` |
 | `make scratch` / `make scratch-clean` | boot / delete a throwaway clone of the base image to poke at |
+| `make cert-status` | platform-CA + Vault leaf expiry, and whether the chain verifies |
+| `make repair` | check + fix the whole chain and restart it cleanly, in order |
 
 > **Gotcha:** editing the Python daemon has no effect until `make restart` (launchd `KeepAlive` keeps
 > the old process). `vm-build.sh` is copied fresh into each VM per job, so its edits apply immediately.
@@ -103,6 +105,8 @@ The agent is "visible" (Argo has no node registry) when it shows up as a **consu
 | `*.plist.tmpl` | Templates → LaunchAgents (build agent, Vault Agent) + LaunchDaemon (pf bridge) |
 | `start-agent.sh` | launchd entrypoint: sources the Vault-rendered env, execs `agent.py` |
 | `bridge-vault.sh` / `bridge-vault.pf` | pf source-NAT so build VMs reach internal Vault over the VPN |
+| `repair.sh` | `make repair` — checks + fixes the chain in dependency order, restarts cleanly |
+| `cert-status.sh` | `make cert-status` — platform-CA / internal-TLS expiry + chain verification |
 | `platform-ca.crt` | Bootstrap internal CA (public cert) — seeds TLS trust before Vault Agent runs |
 | `GO-LIVE.md` | Detailed runbook: hardening, bridge, first Argo submit, troubleshooting |
 
@@ -130,6 +134,72 @@ Apple permits **2 macOS VMs per host** — a hard per-Mac cap. To run 2 concurre
 `agent.prefetch: 2` and size `vm.cpus/memory_gb` so two VMs fit (e.g. 5 CPU / 18 GB each on a
 12-core / 48 GB M4 Pro). For more throughput, add more Macs — each with a unique `agent.name`,
 all consuming the same `mobile.builds` queue (RabbitMQ load-balances).
+
+## Internal TLS / platform CA
+
+Two files named `platform-ca.crt`, with very different jobs. Confusing them costs an afternoon:
+
+| file | role | who maintains it |
+|---|---|---|
+| `vault/platform-ca.crt` | **Runtime** trust anchor — what Vault Agent and the RabbitMQ TLS actually use | Vault Agent, from `secret/platform/ca-cert`. Automatic. |
+| `platform-ca.crt` (repo root) | **Bootstrap seed**, git-tracked. `install.sh` copies it to the runtime path *only when that file is missing* | You, by hand — see below |
+
+Check both, plus whether Vault's cert actually verifies, any time:
+
+```bash
+make cert-status
+```
+
+### When the platform CA rotates
+
+**Normally: nothing to do.** The platform team publishes the new CA to `secret/platform/ca-cert`;
+Vault Agent notices and re-renders `vault/platform-ca.crt` within minutes. Because the platform
+issues the replacement well before the old one lapses, the runtime file is already correct by the
+time the old cert expires — no restart, no downtime, no build failures.
+
+Two things still need a human:
+
+1. **Refresh the git-tracked seed** so the *next* new Mac bootstraps correctly. A stale seed is
+   invisible on every running machine and only bites months later, when someone provisions a new
+   builder and Vault Agent can't establish TLS to fetch anything:
+   ```bash
+   make cert-seed
+   ```
+   Then commit the result. `make cert-status` warns whenever the seed and runtime CA disagree.
+
+2. **Bootstrap deadlock — only if the CA rotates to a new key pair while the runtime file is
+   already expired.** Vault Agent's `ca_cert` *is* the file it renders, so it cannot fetch a new CA
+   it does not yet trust. Break the loop by writing the new CA in by hand, then restarting:
+   ```bash
+   # get the new CA out-of-band from the platform team, then:
+   cp /path/to/new-platform-ca.crt vault/platform-ca.crt
+   make start-vault && make cert-status
+   ```
+   A same-key renewal (the usual case) never deadlocks: the old cert's public key still verifies a
+   chain signed by the new one, so the agent can reach Vault and re-render on its own.
+
+3. **Update the cluster side too — it is a separate copy.** The Argo dispatch pod has its own CA
+   bundle (image or k8s secret), which nothing here maintains. On 2026-08-20 that copy lapsed while
+   every Mac stayed healthy, and dispatch stopped being able to reach RabbitMQ:
+   ```
+   ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
+       certificate verify failed: certificate has expired
+   ```
+   Read that carefully — the **CA in the client's bundle** expired, not the broker's certificate.
+   The tell is that the server's own leaf is still valid, so the same endpoint verifies fine from a
+   host with a current CA. No jobs get enqueued, so it looks like "builds are failing" even though
+   the agents are idle and fine. Confirm which side is at fault from any machine:
+   ```bash
+   make cert-status        # green here => the CA is fine and the stale bundle is the client's
+   ```
+
+The **Vault server leaf** cert is separate, issued by this CA, and rotates far more often — it is
+the more likely thing to lapse. `make cert-status` prints its expiry too.
+
+Build VMs are not part of this. `vm-build.sh` passes only `VAULT_ADDR` and `VAULT_TOKEN` into the
+VM; nothing here installs the platform CA into the guest or its keychain, so a CA rotation never
+requires re-baking the base image. How the app's Fastfile trusts Vault inside the VM lives in the
+mobile-app repo.
 
 ## Troubleshooting
 
