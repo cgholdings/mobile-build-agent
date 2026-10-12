@@ -96,6 +96,8 @@ The agent is "visible" (Argo has no node registry) when it shows up as a **consu
 | `agent.py` | Host daemon: RabbitMQ consumer, status + **log** publisher, per-job orchestration |
 | `vmrunner.py` | Boots/tears down the ephemeral Tart VM, streams the build over SSH |
 | `vm-build.sh` | Runs **inside** the VM: git checkout → `make init` → `make <target>` (fastlane) |
+| `android_e2e.py` | Runs a VM-built Patrol Android suite on the **host** emulator (see "E2E jobs") |
+| `setup-android-host.sh` | `make android-host` — installs that host emulator + the `cgh-e2e` AVD |
 | `vmexec.py` | Run commands in a Tart VM over password SSH (used by provisioning/baking) |
 | `creds.py` | RabbitMQ creds from the Vault-rendered env (`vault/rabbitmq.env`) |
 | `provision-base-image.sh` | One-time: builds `mobile-builder-base` (Flutter/Android/Ruby/fastlane) |
@@ -125,6 +127,32 @@ Makefile + fastlane own the actual build + publish**. `make_target` is e.g. `dep
 The agent publishes to exchange `mobile.status` (routing key = `job_id`): coarse
 `accepted → building → publishing → succeeded|failed` status messages, plus batched
 `{"type":"log","lines":[...]}` messages carrying the raw build output for the Argo node logs.
+Before the terminal status it also sends any files the job left in `out/artifacts/` (E2E
+failure screenshots) as `{"type":"artifact","name","content_type","encoding":"base64","data"}`,
+capped by `artifacts.max_files` / `max_file_bytes`; the dispatcher stores them as the Argo
+node's output artifacts.
+
+---
+
+## E2E jobs
+
+The mobile-app Patrol suite runs headless through the same pipe (`make <ios|android>-e2e-staging`
+for the PR merge gate, `make <ios|android>-e2e-smoke-production` hourly; mobile-app
+`scripts/e2e.sh`).
+
+- **iOS** runs entirely in the VM: a throwaway Simulator booted with `simctl` (no Simulator.app).
+- **Android** cannot run in the VM — the emulator needs a hypervisor, and Tart's nested
+  virtualization is Linux-guest only. The VM only **builds** the app + test APKs
+  (`E2E_ANDROID_HANDOFF_DIR` → `out/android-e2e/`). After the VM is torn down, `android_e2e.py`
+  boots a fresh headless emulator **on the host**, installs both APKs, runs the instrumentation
+  over adb and reports each test like `patrol test` would. PR code only ever runs inside the
+  emulator's sandbox, never on the host itself. One Android run at a time per host; a second
+  waits. One-time setup per Mac: `make android-host`.
+- On failure the suite logs `E2E_SCREENSHOT <name>` and holds the screen; the screenshot (iOS:
+  `simctl io`, in the VM; Android: `adb screencap`, on the host) lands in `out/artifacts/` and
+  is shipped back as an artifact.
+- The APK embeds the E2E test account's credentials (dart-defines). It only ever exists in the
+  job dir on this host, which `keep_jobs` rotates.
 
 ---
 

@@ -24,6 +24,8 @@ echo "[$(date)] installing toolchain on $IP (Ruby compile can take several minut
 export PATH=/opt/homebrew/bin:\$PATH
 echo '-- fvm install $FLUTTER_PIN (+ set global for bare dart/flutter) --'
 fvm install $FLUTTER_PIN && fvm global $FLUTTER_PIN && fvm list
+echo '-- patrol_cli (mobile-app E2E; keep in step with scripts/e2e.sh) --'
+fvm dart pub global activate patrol_cli 4.8.0 || true
 echo '-- rbenv install $RUBY_PIN --'; rbenv install -s $RUBY_PIN
 echo '-- gems into $RUBY_PIN (cocoapods/bundler/fastlane) --'
 RBENV_VERSION=$RUBY_PIN gem install cocoapods bundler fastlane
