@@ -33,6 +33,21 @@ vm:
   ssh_user: admin                 # Cirrus macOS images default to admin/admin
   ssh_password: admin
 
+# Android E2E runs on an emulator on THIS host (macOS VMs cannot nest the hypervisor it needs);
+# the VM only builds the APKs. Install it once with `make android-host`.
+android_e2e:
+  sdk_root: /opt/homebrew/share/android-commandlinetools
+  avd: cgh-e2e
+  port: 5580                      # emulator-5580; one Android E2E run at a time per host
+  boot_timeout_sec: 300
+  test_timeout_sec: 3000
+
+# Files a job leaves in its out/artifacts/ (E2E failure screenshots) are sent back over
+# RabbitMQ and stored by Argo as the run's artifacts. Capped so a runaway test cannot flood it.
+artifacts:
+  max_files: 10
+  max_file_bytes: 4194304         # 4 MiB
+
 # Vault access passed INTO the build VM. The mobile-app Fastfiles read signing/publish creds from
 # Vault themselves (load_vault_secrets), so the agent only forwards VAULT_ADDR + the current token.
 # Requires the VM to reach Vault — via the scoped pf bridge (see GO-LIVE.md / bridge-vault.pf).

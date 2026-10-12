@@ -9,6 +9,7 @@ TestFlight / Play / Firebase, then destroys the VM. Build status is streamed bac
 
 The host talks to RabbitMQ; the VM does the building. See config.example.yaml and README.md.
 """
+import base64
 import json
 import os
 import signal
@@ -97,6 +98,16 @@ class Agent:
         # marshal onto the connection's IO thread
         self._conn.add_callback_threadsafe(_do)
 
+    def _publish_artifact(self, job_id, name, data, content_type, skipped):
+        # Contract: {"type":"artifact","name","content_type","encoding":"base64","data"} on
+        # mobile.status; the dispatcher stores them as the Argo node's output artifacts.
+        if skipped:
+            self.publish_status(job_id, type="log", lines=[f"[agent] artifact {name} {skipped}"])
+            return
+        self.publish_status(job_id, type="artifact", name=name, content_type=content_type,
+                            encoding="base64", data=base64.b64encode(data).decode("ascii"))
+        log(f"job {job_id}: shipped artifact {name} ({len(data)} bytes)")
+
     def _ack(self, delivery_tag: int, requeue_on_fail: bool = False, nack: bool = False):
         def _do():
             try:
@@ -135,6 +146,8 @@ class Agent:
                 # raw build output → Argo node logs (batched by the runner). The coarse
                 # phase/progress status messages above still drive the headline.
                 log_cb=lambda lines: self.publish_status(job_id, type="log", lines=lines),
+                artifact_cb=lambda name, data, content_type, skipped: self._publish_artifact(
+                    job_id, name, data, content_type, skipped),
             )
             self.publish_status(job_id, state="succeeded", phase="done", progress=1.0,
                                 platform=None, message="build + publish complete",

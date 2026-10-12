@@ -5,7 +5,10 @@ Host responsibilities (here):
   * clone the base image to a throwaway VM
   * stage job context + publish secrets into a shared dir mounted into the VM
   * boot, SSH in, run vm-build.sh, stream its @@STATUS lines back to the caller
-  * collect out/result.json, then destroy the VM and prune old job dirs
+  * for Android E2E jobs, run the APKs the VM built on a host emulator (android_e2e.py) —
+    macOS VMs cannot nest the hypervisor the emulator needs
+  * collect out/result.json, ship out/artifacts/* (E2E failure screenshots) back to the caller,
+    then destroy the VM and prune old job dirs
 
 Guest responsibilities live in vm-build.sh (git checkout, fvm flutter build, fastlane publish).
 """
@@ -17,8 +20,11 @@ import time
 
 import paramiko
 
+from android_e2e import AndroidE2E, AndroidE2EError
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUEST_MOUNT = "/Volumes/My Shared Files/io"   # where Tart mounts our --dir=io:...
+ARTIFACT_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".txt": "text/plain"}
 
 
 class BuildError(Exception):
@@ -44,6 +50,10 @@ class TartRunner:
         self.ssh_pass = v.get("ssh_password", "admin")
         self.workspace = cfg["agent"]["workspace"]
         self.keep_jobs = int(cfg["agent"].get("keep_jobs", 5))
+        self.android_e2e = AndroidE2E(cfg)
+        a = cfg.get("artifacts") or {}
+        self.max_artifacts = int(a.get("max_files", 10))
+        self.max_artifact_bytes = int(a.get("max_file_bytes", 4 * 1024 * 1024))
 
     # -- tart helpers ----------------------------------------------------------
     def _tart(self, *args, check=True, capture=False):
@@ -117,8 +127,33 @@ class TartRunner:
         except Exception:  # noqa: BLE001
             pass
 
+    def _ship_artifacts(self, jobdir: str, artifact_cb) -> None:
+        """Hand files the job left in out/artifacts/ (E2E failure screenshots) to the caller.
+
+        Capped in count and size: they travel as RabbitMQ messages, and a runaway test must not
+        flood the broker. Skipped files are reported in the log instead.
+        """
+        art_dir = os.path.join(jobdir, "out", "artifacts")
+        if not artifact_cb or not os.path.isdir(art_dir):
+            return
+        names = sorted(n for n in os.listdir(art_dir)
+                       if os.path.splitext(n)[1].lower() in ARTIFACT_TYPES)
+        shipped = 0
+        for name in names:
+            path = os.path.join(art_dir, name)
+            size = os.path.getsize(path)
+            if size > self.max_artifact_bytes:
+                artifact_cb(name, None, None, f"skipped: {size} bytes > {self.max_artifact_bytes}")
+                continue
+            if shipped >= self.max_artifacts:
+                artifact_cb(name, None, None, f"skipped: over the {self.max_artifacts}-file cap")
+                continue
+            with open(path, "rb") as f:
+                artifact_cb(name, f.read(), ARTIFACT_TYPES[os.path.splitext(name)[1].lower()], None)
+            shipped += 1
+
     # -- main entry ------------------------------------------------------------
-    def run(self, job: dict, status_cb, should_stop, log_cb=None) -> dict:
+    def run(self, job: dict, status_cb, should_stop, log_cb=None, artifact_cb=None) -> dict:
         job_id = job["job_id"]
         vm = f"build-{job_id[:8]}"
         jobdir = os.path.join(self.workspace, job_id)
@@ -126,6 +161,20 @@ class TartRunner:
         log_tail: list[str] = []
         run_proc = None
         stream_fp = None
+        vm_up = [False]
+
+        def teardown_vm():
+            if not vm_up[0]:
+                return
+            vm_up[0] = False
+            try:
+                if run_proc:
+                    run_proc.terminate()
+                self._tart("stop", vm, check=False)
+                time.sleep(1)
+                self._tart("delete", vm, check=False)
+            except Exception:  # noqa: BLE001
+                pass
 
         def keep_tail(line):
             log_tail.append(line)
@@ -171,6 +220,7 @@ class TartRunner:
                 stream_fp = None
             status_cb(state="building", phase="boot", progress=0.02, message=f"cloning VM {vm}")
             self._tart("clone", self.base, vm)
+            vm_up[0] = True
             self._tart("set", vm, "--cpu", str(self.cpus), "--memory", str(self.mem * 1024))
 
             run_proc = subprocess.Popen(
@@ -220,6 +270,38 @@ class TartRunner:
                                  platform=result.get("platform"),
                                  progress=result.get("progress", 0.5),
                                  log_tail="\n".join(log_tail[-80:]))
+
+            handoff = os.path.join(jobdir, "out", "android-e2e")
+            if os.path.exists(os.path.join(handoff, "run.json")):
+                teardown_vm()   # free the VM's CPU/RAM before booting the emulator
+                flush_logs(force=True)
+                status_cb(state="building", phase="e2e", platform="android", progress=0.8,
+                          message="running Android E2E on the host emulator")
+                try:
+                    failures = self.android_e2e.run(
+                        handoff, os.path.join(jobdir, "out", "artifacts"), on_log)
+                except AndroidE2EError as e:
+                    raise BuildError(f"Android E2E could not run: {e}", phase="e2e",
+                                     platform="android", progress=0.8,
+                                     log_tail="\n".join(log_tail[-80:])) from e
+                finally:
+                    flush_logs(force=True)
+                if failures:
+                    summary = ["==== E2E FAILURES · android ===="]
+                    for name, message in failures:
+                        summary.append(f"❌ {name}")
+                        # Android prefixes the exception class: "java.lang.AssertionError: ..."
+                        for l in message.splitlines():
+                            for mark in ("Failed at step:", "On screen:"):
+                                if mark in l:
+                                    summary.append(l[l.index(mark):])
+                    for line in summary:
+                        on_log(line)
+                    flush_logs(force=True)
+                    raise BuildError(f"Android E2E: {len(failures)} test(s) failed", phase="e2e",
+                                     platform="android", progress=0.9,
+                                     log_tail="\n".join(log_tail[-80:]))
+
             return {"artifacts": result.get("artifacts", {}),
                     "log_tail": "\n".join(log_tail[-40:])}
 
@@ -228,19 +310,17 @@ class TartRunner:
                 flush_logs(force=True)
             except Exception:  # noqa: BLE001
                 pass
+            # before the terminal status, so the dispatcher has them when it stops listening
+            try:
+                self._ship_artifacts(jobdir, artifact_cb)
+            except Exception:  # noqa: BLE001
+                pass
             if stream_fp:
                 try:
                     stream_fp.close()
                 except Exception:  # noqa: BLE001
                     pass
-            try:
-                if run_proc:
-                    run_proc.terminate()
-                self._tart("stop", vm, check=False)
-                time.sleep(1)
-                self._tart("delete", vm, check=False)
-            except Exception:  # noqa: BLE001
-                pass
+            teardown_vm()
             self._prune()
 
     @staticmethod

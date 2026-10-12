@@ -109,6 +109,14 @@ run bash -c "cd '$WORK/src/app' 2>/dev/null && rbenv install -s" || run rbenv in
 emit building init 0.30 "make init"
 run make init || fail init 0.30 "make init failed"
 
+# Files the job leaves here are shipped back to Argo as the run's artifacts (the mobile-app
+# E2E script writes failure screenshots here). Lives on the host share, so it survives teardown.
+export E2E_ARTIFACT_DIR="$OUT/artifacts"
+mkdir -p "$E2E_ARTIFACT_DIR"
+# Android E2E cannot run here (no hypervisor inside a macOS VM): the mobile-app E2E script only
+# BUILDS the APKs into this dir, and the host runs them on its own emulator (android_e2e.py).
+export E2E_ANDROID_HANDOFF_DIR="$OUT/android-e2e"
+
 # ---- make <target> (build + publish; fastlane under the hood) ---------------
 emit publishing "$MAKE_TARGET" 0.60 "make $MAKE_TARGET"
 run make "$MAKE_TARGET" || fail "$MAKE_TARGET" 0.60 "make $MAKE_TARGET failed"
