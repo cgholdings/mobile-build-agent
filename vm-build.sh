@@ -20,6 +20,8 @@ BUILD_LOG="$OUT/build.log"
 # ~/fvm/default/bin provides bare `dart`/`flutter` — the Fastfile's `melos run gen` shim calls bare
 # `dart` (not `fvm exec`), so it must be on PATH.
 export PATH="$HOME/.rbenv/shims:$HOME/.rbenv/bin:/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/fvm/default/bin:$HOME/.pub-cache/bin:$PATH"
+# Xcode 26 can choose Metal first; CocoaPods needs XcodeDefault's Swift libraries.
+export TOOLCHAINS=com.apple.dt.toolchain.XcodeDefault
 export ANDROID_SDK_ROOT="/opt/homebrew/share/android-commandlinetools"
 export ANDROID_HOME="$ANDROID_SDK_ROOT"
 # UTF-8 locale — fastlane/Ruby otherwise default to US-ASCII and throw "invalid byte sequence"
