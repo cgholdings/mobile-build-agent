@@ -105,7 +105,14 @@ class TartRunner:
         except OSError:
             ctx["vault_token"] = ""
         # optional SSH deploy-key fallback (used only if the job carries no github_token)
-        ctx["_creds"] = {"git_ssh_key": None}
+        ctx["_creds"] = {"git_ssh_key": None, "vault_cacert": None}
+        # The internal platform CA (kept fresh by Vault Agent), so tools in the VM can verify
+        # Vault's certificate instead of disabling verification.
+        ca = (self.cfg.get("broker") or {}).get("tls_ca_file") or os.path.join(HERE, "vault",
+                                                                             "platform-ca.crt")
+        if os.path.exists(ca):
+            shutil.copy2(ca, os.path.join(sec_dir, "platform-ca.crt"))
+            ctx["_creds"]["vault_cacert"] = f"{GUEST_MOUNT}/in/secrets/platform-ca.crt"
         sshk = (self.cfg.get("git") or {}).get("ssh_key")
         if sshk and os.path.exists(sshk):
             dst = os.path.join(sec_dir, "git_ssh_key")

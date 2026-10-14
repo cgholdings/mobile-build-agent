@@ -78,6 +78,10 @@ export VAULT_ADDR=$(get vault_addr https://vault.tech.cgholdings.internal)
 export VAULT_TOKEN=$(get vault_token)   # short-lived Vault Agent token, injected by the host
 export GITHUB_TOKEN=$(get github_token)
 GIT_KEY=$(get _creds.git_ssh_key)       # optional SSH fallback if no github_token
+# The internal platform CA that signs Vault's certificate (host's live copy), for anything in
+# the VM that verifies TLS to Vault — e.g. the mobile-app E2E script's curl.
+VAULT_CACERT=$(get _creds.vault_cacert)
+[ -n "$VAULT_CACERT" ] && [ -f "$VAULT_CACERT" ] && export VAULT_CACERT || unset VAULT_CACERT
 [ -z "$VAULT_TOKEN" ] && fail creds 0.05 "no vault_token in job context (host injects it)"
 
 # ---- checkout ---------------------------------------------------------------
