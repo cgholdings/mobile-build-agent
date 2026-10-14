@@ -132,6 +132,26 @@ failure screenshots) as `{"type":"artifact","name","content_type","encoding":"ba
 capped by `artifacts.max_files` / `max_file_bytes`; the dispatcher stores them as the Argo
 node's output artifacts.
 
+Only the agent sends the terminal `succeeded|failed`, after the job's last log batch and
+artifacts. Inside the VM, `vm-build.sh` reports progress only (`@@STATUS` with state
+`building|publishing`; any other `@@STATUS` line is kept as a plain log line) and its outcome
+through its exit code and `out/result.json`.
+
+### Delivery ownership
+
+A job is acked when it finishes, on the channel that delivered it: the unacked delivery is what
+limits a Mac to `agent.prefetch` jobs. If that channel closes first (lost connection, or the
+broker's `consumer_timeout`), RabbitMQ requeues the job; the execution that lost it stops at its
+next check, tears down its VM and sends nothing more. A redelivery to the same Mac starts once
+that execution has stopped; another Mac can start it while the old VM is still shutting down.
+Each execution has its own VM (`build-<job_id[:8]>-<run>`) and job dir (`<job_id>.<run>/`).
+
+`agent.max_job_seconds` (5400) bounds a whole job from pickup — the VM build, the host Android
+E2E, and any wait for a VM slot, the emulator or an earlier execution of the job. The platform's
+RabbitMQ `consumer_timeout` (`rabbitmqcluster.yaml`) must stay above it; Argo's workflow deadlines
+must cover queue wait plus it. A redelivery starts the bound again, so Argo's deadline covers a
+rerun only for jobs shorter than (deadline − bound).
+
 ---
 
 ## E2E jobs
@@ -250,5 +270,6 @@ diagnosis tool. Use `SKIP_VM=1` to skip the ~2 min probe VM.
   (or just `make bridge-anchor`). The bridge daemon also self-heals this within 30s of noticing.
 - **No live logs in Argo**: build output must reach `vm-build.sh`'s stdout — its `run()` helper `tee`s
   to both stdout (streamed) and `build.log`. Per-job stream is also saved to
-  `build-workspace/<job_id>/out/stream.log`.
-- Per-job logs/artifacts: `build-workspace/<job_id>/out/` (kept for the last `agent.keep_jobs`).
+  `build-workspace/<job_id>.<run>/out/stream.log`.
+- Per-job logs/artifacts: `build-workspace/<job_id>.<run>/out/` (the newest `agent.keep_jobs`
+  dirs of finished executions are kept).

@@ -102,7 +102,7 @@ launchctl kickstart -k gui/$(id -u)/com.cgholdings.vault-agent     # restart vau
 launchctl bootout   gui/$(id -u)/com.cgholdings.buildagent         # stop (until next login/bootstrap)
 ```
 **Logs:** `$AGENT/logs/{agent.out.log, agent.err.log, vault-agent.err.log}`; per-job under
-`$AGENT/build-workspace/<job_id>/out/`.
+`$AGENT/build-workspace/<job_id>.<run>/out/`.
 
 **Secret rotation:** rotate in Vault; Vault Agent re-renders and auto-bounces the build agent.
 If the AppRole `secret_id` is rotated, drop the new one into `$AGENT/secrets/vault_secret_id`
