@@ -6,10 +6,14 @@ virtualization for Linux guests only). So for `android-e2e-*` jobs the VM only B
 mobile-app's scripts/e2e.sh runs `patrol build android` and leaves, in out/android-e2e/:
     app.apk, test.apk, run.json  {"package": "...", "flavor": "...", "tags": "..."}
 and this runner, on the host, does what `patrol test` would have done on a device:
-    boot a fresh headless emulator -> adb install both APKs -> am instrument -> report.
+    boot a fresh headless emulator -> adb install both APKs + the AndroidX Test Orchestrator
+    -> run the suite under the orchestrator -> report.
+The orchestrator with clearPackageData gives every test its own app process and clean app data,
+as the app declares (testOptions.execution) and Patrol requires: its PatrolAppService serves one
+test per app process.
 
 PR code still never runs on the host itself: only inside the emulator's sandbox. The host only
-needs the Android SDK (`make android-host`), not Flutter.
+needs the Android SDK and the orchestrator APKs (`make android-host`), not Flutter.
 
 Output mirrors `patrol test`: patrol's PATROL_LOG entries are read from logcat and printed as
 step/log lines, and each test reports ✅ / ❌ / ⏩ with its failure message. When a test logs
@@ -26,6 +30,13 @@ import time
 
 _RESULT = {0: "✅", -2: "❌", -1: "❌", -3: "⏩", -4: "⏩"}
 _SHOT_MARK = "E2E_SCREENSHOT "
+# Provisioned into <sdk_root>/androidx-test/ by setup-android-host.sh.
+_TEST_UTIL_APKS = ("test-services.apk", "orchestrator.apk")
+_ORCHESTRATOR_COMMAND = (
+    "CLASSPATH=$(pm path androidx.test.services) app_process / "
+    "androidx.test.services.shellexecutor.ShellMain am instrument -w -r "
+    "-e targetInstrumentation {runner} -e clearPackageData true "
+    "androidx.test.orchestrator/.AndroidTestOrchestrator")
 
 
 class AndroidE2EError(Exception):
@@ -46,6 +57,7 @@ class AndroidE2E:
         self.serial = f"emulator-{self.port}"
         self.boot_timeout = int(a.get("boot_timeout_sec", 300))
         self.max_shots = int((cfg.get("artifacts") or {}).get("max_files", 10))
+        self.test_util_apks = [os.path.join(sdk, "androidx-test", apk) for apk in _TEST_UTIL_APKS]
 
     # -- adb helpers -------------------------------------------------------------
     def _adb(self, *args, check=True, timeout=120):
@@ -159,14 +171,18 @@ class AndroidE2E:
         with open(os.path.join(handoff_dir, "run.json")) as f:
             spec = json.load(f)
         package = spec["package"]
+        missing = [apk for apk in self.test_util_apks if not os.path.isfile(apk)]
+        if missing:
+            raise AndroidE2EError(f"missing {', '.join(missing)}; run `make android-host`")
         on_log(f"[android-e2e] waiting for the host emulator (one Android E2E run at a time)")
         with self._emulator_turn(lease):
             emu = self._boot(on_log, lease)
             stop = threading.Event()
             follower = None
             try:
-                for apk in ("app.apk", "test.apk"):
-                    self._adb("install", "-r", "-t", os.path.join(handoff_dir, apk), timeout=300)
+                suite = [os.path.join(handoff_dir, apk) for apk in ("app.apk", "test.apk")]
+                for apk in suite + self.test_util_apks:
+                    self._adb("install", "-r", "-t", apk, timeout=300)
                 runner = self._instrumentation(package)
                 on_log(f"[android-e2e] {runner} · flavor={spec.get('flavor')} "
                        f"tags={spec.get('tags') or 'all'}")
@@ -189,7 +205,7 @@ class AndroidE2E:
     def _instrument(self, runner: str, on_log, lease) -> list:
         """`am instrument -r` exits 0 even when tests fail; results come from its status lines."""
         proc = subprocess.Popen(
-            [self.adb, "-s", self.serial, "shell", "am", "instrument", "-w", "-r", runner],
+            [self.adb, "-s", self.serial, "shell", _ORCHESTRATOR_COMMAND.format(runner=runner)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         threading.Thread(target=self._kill_when_lease_ends, args=(proc, lease), daemon=True).start()
         failures, status, stack, in_stack, crashed = [], {}, [], False, False

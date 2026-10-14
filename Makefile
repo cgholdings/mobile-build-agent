@@ -58,7 +58,7 @@ bake-versions: ## Cache pinned Flutter + Ruby (+ cocoapods/bundler/fastlane gems
 bake-android: ## Bake Android SDK platform+build-tools into the existing image. API=35 BT=35.0.0
 	bash $(AGENT_DIR)/bake-android.sh $(API) $(BT)
 
-android-host: ## Install the HOST Android emulator + AVD used by Android E2E jobs. API=35
+android-host: ## Install the HOST Android emulator, AVD + test orchestrator for Android E2E jobs. API=35
 	bash $(AGENT_DIR)/setup-android-host.sh $(API)
 
 secret-id: ## Unwrap the Vault secret_id.  Usage: make secret-id WRAP=hvs.XXXX
@@ -122,7 +122,10 @@ logs-fb: ## Tail the firebase-CLI image-update log
 verify: ## Run readiness checks (venv, image, broker, secrets, services)
 	@echo "venv:";   test -x $(PY) && echo "  ok" || echo "  MISSING (make deps)"
 	@echo "image:";  tart list 2>/dev/null | grep -q mobile-builder-base && echo "  ok" || echo "  MISSING (make image)"
-	@echo "android e2e:"; /opt/homebrew/share/android-commandlinetools/emulator/emulator -list-avds 2>/dev/null | grep -qx cgh-e2e && echo "  ok" || echo "  MISSING (make android-host)"
+	@echo "android e2e:"; sdk=/opt/homebrew/share/android-commandlinetools; \
+	  $$sdk/emulator/emulator -list-avds 2>/dev/null | grep -qx cgh-e2e \
+	  && test -s $$sdk/androidx-test/test-services.apk && test -s $$sdk/androidx-test/orchestrator.apk \
+	  && echo "  ok" || echo "  MISSING (make android-host)"
 	@echo "broker:"; nc -vz -G 6 $(BROKER) 5671 >/dev/null 2>&1 && echo "  reachable" || echo "  UNREACHABLE (VPN?)"
 	@echo "vault seeds:"; for f in vault/platform-ca.crt secrets/vault_role_id secrets/vault_secret_id; do \
 	  test -s $(AGENT_DIR)/$$f && echo "  ok   $$f" || echo "  MISS $$f"; done

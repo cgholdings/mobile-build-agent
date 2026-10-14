@@ -104,6 +104,11 @@ launchctl bootout   gui/$(id -u)/com.cgholdings.buildagent         # stop (until
 **Logs:** `$AGENT/logs/{agent.out.log, agent.err.log, vault-agent.err.log}`; per-job under
 `$AGENT/build-workspace/<job_id>.<run>/out/`.
 
+**Android E2E host:** `make android-host` installs the emulator, the `cgh-e2e` AVD and the
+checksum-pinned AndroidX Test Orchestrator APKs (`<sdk>/androidx-test/`) that every Android E2E
+run installs. Re-run it after pulling a change to `setup-android-host.sh`; until then Android E2E
+jobs fail with `missing …/androidx-test/…apk; run make android-host`.
+
 **Secret rotation:** rotate in Vault; Vault Agent re-renders and auto-bounces the build agent.
 If the AppRole `secret_id` is rotated, drop the new one into `$AGENT/secrets/vault_secret_id`
 (unwrap a fresh wrapping token) and `launchctl kickstart -k gui/$(id -u)/com.cgholdings.vault-agent`.
