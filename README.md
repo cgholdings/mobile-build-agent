@@ -97,7 +97,7 @@ The agent is "visible" (Argo has no node registry) when it shows up as a **consu
 | `vmrunner.py` | Boots/tears down the ephemeral Tart VM, streams the build over SSH |
 | `vm-build.sh` | Runs **inside** the VM: git checkout → `make init` → `make <target>` (fastlane) |
 | `android_e2e.py` | Runs a VM-built Patrol Android suite on the **host** emulator (see "E2E jobs") |
-| `setup-android-host.sh` | `make android-host` — installs that host emulator + the `cgh-e2e` AVD |
+| `setup-android-host.sh` | `make android-host` — that host emulator, the `cgh-e2e` AVD, the pinned test orchestrator |
 | `vmexec.py` | Run commands in a Tart VM over password SSH (used by provisioning/baking) |
 | `creds.py` | RabbitMQ creds from the Vault-rendered env (`vault/rabbitmq.env`) |
 | `provision-base-image.sh` | One-time: builds `mobile-builder-base` (Flutter/Android/Ruby/fastlane) |
@@ -132,6 +132,26 @@ failure screenshots) as `{"type":"artifact","name","content_type","encoding":"ba
 capped by `artifacts.max_files` / `max_file_bytes`; the dispatcher stores them as the Argo
 node's output artifacts.
 
+Only the agent sends the terminal `succeeded|failed`, after the job's last log batch and
+artifacts. Inside the VM, `vm-build.sh` reports progress only (`@@STATUS` with state
+`building|publishing`; any other `@@STATUS` line is kept as a plain log line) and its outcome
+through its exit code and `out/result.json`.
+
+### Delivery ownership
+
+A job is acked when it finishes, on the channel that delivered it: the unacked delivery is what
+limits a Mac to `agent.prefetch` jobs. If that channel closes first (lost connection, or the
+broker's `consumer_timeout`), RabbitMQ requeues the job; the execution that lost it stops at its
+next check, tears down its VM and sends nothing more. A redelivery to the same Mac starts once
+that execution has stopped; another Mac can start it while the old VM is still shutting down.
+Each execution has its own VM (`build-<job_id[:8]>-<run>`) and job dir (`<job_id>.<run>/`).
+
+`agent.max_job_seconds` (5400) bounds a whole job from pickup — the VM build, the host Android
+E2E, and any wait for a VM slot, the emulator or an earlier execution of the job. The platform's
+RabbitMQ `consumer_timeout` (`rabbitmqcluster.yaml`) must stay above it; Argo's workflow deadlines
+must cover queue wait plus it. A redelivery starts the bound again, so Argo's deadline covers a
+rerun only for jobs shorter than (deadline − bound).
+
 ---
 
 ## E2E jobs
@@ -144,10 +164,13 @@ for the PR merge gate, `make <ios|android>-e2e-smoke-production` hourly; mobile-
 - **Android** cannot run in the VM — the emulator needs a hypervisor, and Tart's nested
   virtualization is Linux-guest only. The VM only **builds** the app + test APKs
   (`E2E_ANDROID_HANDOFF_DIR` → `out/android-e2e/`). After the VM is torn down, `android_e2e.py`
-  boots a fresh headless emulator **on the host**, installs both APKs, runs the instrumentation
-  over adb and reports each test like `patrol test` would. PR code only ever runs inside the
-  emulator's sandbox, never on the host itself. One Android run at a time per host; a second
-  waits. One-time setup per Mac: `make android-host`.
+  boots a fresh headless emulator **on the host**, installs both APKs and runs the suite over adb
+  under the AndroidX Test Orchestrator with `clearPackageData` — one app process with clean data
+  per test, as the app declares (`testOptions.execution`) and Patrol's app service requires — and
+  reports each test like `patrol test` would. PR code only ever runs inside the emulator's
+  sandbox, never on the host itself. One Android run at a time per host; a second waits. One-time
+  setup per Mac: `make android-host` (re-run it when its orchestrator pin follows the app's
+  `androidTestUtil`).
 - On failure the suite logs `E2E_SCREENSHOT <name>` and holds the screen; the screenshot (iOS:
   `simctl io`, in the VM; Android: `adb screencap`, on the host) lands in `out/artifacts/` and
   is shipped back as an artifact.
@@ -250,5 +273,6 @@ diagnosis tool. Use `SKIP_VM=1` to skip the ~2 min probe VM.
   (or just `make bridge-anchor`). The bridge daemon also self-heals this within 30s of noticing.
 - **No live logs in Argo**: build output must reach `vm-build.sh`'s stdout — its `run()` helper `tee`s
   to both stdout (streamed) and `build.log`. Per-job stream is also saved to
-  `build-workspace/<job_id>/out/stream.log`.
-- Per-job logs/artifacts: `build-workspace/<job_id>/out/` (kept for the last `agent.keep_jobs`).
+  `build-workspace/<job_id>.<run>/out/stream.log`.
+- Per-job logs/artifacts: `build-workspace/<job_id>.<run>/out/` (the newest `agent.keep_jobs`
+  dirs of finished executions are kept).

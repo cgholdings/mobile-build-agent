@@ -6,16 +6,21 @@ virtualization for Linux guests only). So for `android-e2e-*` jobs the VM only B
 mobile-app's scripts/e2e.sh runs `patrol build android` and leaves, in out/android-e2e/:
     app.apk, test.apk, run.json  {"package": "...", "flavor": "...", "tags": "..."}
 and this runner, on the host, does what `patrol test` would have done on a device:
-    boot a fresh headless emulator -> adb install both APKs -> am instrument -> report.
+    boot a fresh headless emulator -> adb install both APKs + the AndroidX Test Orchestrator
+    -> run the suite under the orchestrator -> report.
+The orchestrator with clearPackageData gives every test its own app process and clean app data,
+as the app declares (testOptions.execution) and Patrol requires: its PatrolAppService serves one
+test per app process.
 
 PR code still never runs on the host itself: only inside the emulator's sandbox. The host only
-needs the Android SDK (`make android-host`), not Flutter.
+needs the Android SDK and the orchestrator APKs (`make android-host`), not Flutter.
 
 Output mirrors `patrol test`: patrol's PATROL_LOG entries are read from logcat and printed as
 step/log lines, and each test reports ✅ / ❌ / ⏩ with its failure message. When a test logs
 `E2E_SCREENSHOT <name>` (the suite does this on failure, then holds the screen), the screen is
 captured into the job's artifacts dir.
 """
+import contextlib
 import json
 import os
 import re
@@ -25,6 +30,13 @@ import time
 
 _RESULT = {0: "✅", -2: "❌", -1: "❌", -3: "⏩", -4: "⏩"}
 _SHOT_MARK = "E2E_SCREENSHOT "
+# Provisioned into <sdk_root>/androidx-test/ by setup-android-host.sh.
+_TEST_UTIL_APKS = ("test-services.apk", "orchestrator.apk")
+_ORCHESTRATOR_COMMAND = (
+    "CLASSPATH=$(pm path androidx.test.services) app_process / "
+    "androidx.test.services.shellexecutor.ShellMain am instrument -w -r "
+    "-e targetInstrumentation {runner} -e clearPackageData true "
+    "androidx.test.orchestrator/.AndroidTestOrchestrator")
 
 
 class AndroidE2EError(Exception):
@@ -44,8 +56,8 @@ class AndroidE2E:
         self.port = int(a.get("port", 5580))
         self.serial = f"emulator-{self.port}"
         self.boot_timeout = int(a.get("boot_timeout_sec", 300))
-        self.test_timeout = int(a.get("test_timeout_sec", 3000))
         self.max_shots = int((cfg.get("artifacts") or {}).get("max_files", 10))
+        self.test_util_apks = [os.path.join(sdk, "androidx-test", apk) for apk in _TEST_UTIL_APKS]
 
     # -- adb helpers -------------------------------------------------------------
     def _adb(self, *args, check=True, timeout=120):
@@ -55,28 +67,41 @@ class AndroidE2E:
             raise AndroidE2EError(f"adb {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
         return r.stdout
 
-    def _boot(self, on_log):
+    @contextlib.contextmanager
+    def _emulator_turn(self, lease):
+        while not AndroidE2E._lock.acquire(timeout=3):
+            lease.check()
+        try:
+            yield
+        finally:
+            AndroidE2E._lock.release()
+
+    def _boot(self, on_log, lease):
         on_log(f"[android-e2e] booting {self.avd} headless as {self.serial}")
         proc = subprocess.Popen(
             [self.emulator, "-avd", self.avd, "-port", str(self.port), "-no-window", "-no-audio",
              "-no-boot-anim", "-no-snapshot", "-wipe-data", "-gpu", "swiftshader_indirect"],
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        deadline = time.time() + self.boot_timeout
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                raise AndroidE2EError(f"emulator exited during boot (rc {proc.returncode}); "
-                                      f"run `emulator -avd {self.avd}` on the host to see why")
-            r = subprocess.run([self.adb, "-s", self.serial, "shell", "getprop",
-                                "sys.boot_completed"], capture_output=True, text=True)
-            if r.stdout.strip() == "1":
-                for s in ("window_animation_scale", "transition_animation_scale",
-                          "animator_duration_scale"):
-                    self._adb("shell", "settings", "put", "global", s, "0", check=False)
-                on_log("[android-e2e] emulator booted")
-                return proc
-            time.sleep(3)
-        proc.kill()
-        raise AndroidE2EError(f"emulator did not boot within {self.boot_timeout}s")
+        try:
+            deadline = time.time() + self.boot_timeout
+            while time.time() < deadline:
+                lease.check()
+                if proc.poll() is not None:
+                    raise AndroidE2EError(f"emulator exited during boot (rc {proc.returncode}); "
+                                          f"run `emulator -avd {self.avd}` on the host to see why")
+                r = subprocess.run([self.adb, "-s", self.serial, "shell", "getprop",
+                                    "sys.boot_completed"], capture_output=True, text=True)
+                if r.stdout.strip() == "1":
+                    for s in ("window_animation_scale", "transition_animation_scale",
+                              "animator_duration_scale"):
+                        self._adb("shell", "settings", "put", "global", s, "0", check=False)
+                    on_log("[android-e2e] emulator booted")
+                    return proc
+                time.sleep(3)
+            raise AndroidE2EError(f"emulator did not boot within {self.boot_timeout}s")
+        except BaseException:
+            proc.kill()
+            raise
 
     def _instrumentation(self, package: str) -> str:
         out = self._adb("shell", "pm", "list", "instrumentation", check=False)
@@ -85,6 +110,16 @@ class AndroidE2E:
             if m and m.group(2) == package:
                 return m.group(1)
         return f"{package}.test/pl.leancode.patrol.PatrolJUnitRunner"
+
+    @staticmethod
+    def _kill_when_lease_ends(proc, lease):
+        while proc.poll() is None:
+            try:
+                lease.check()
+            except Exception:  # noqa: BLE001 — _instrument's lease.check() after wait() raises it
+                proc.kill()
+                return
+            time.sleep(1)
 
     # -- logcat: patrol log entries + screenshot markers -----------------------
     def _follow_logcat(self, artifact_dir, on_log, stop: threading.Event):
@@ -131,19 +166,23 @@ class AndroidE2E:
             on_log(f"[android-e2e] screenshot failed: {e}")
 
     # -- main entry ---------------------------------------------------------------
-    def run(self, handoff_dir: str, artifact_dir: str, on_log) -> list:
+    def run(self, handoff_dir: str, artifact_dir: str, on_log, lease) -> list:
         """Runs the suite; returns the failures as [(test, message)], [] when all passed."""
         with open(os.path.join(handoff_dir, "run.json")) as f:
             spec = json.load(f)
         package = spec["package"]
+        missing = [apk for apk in self.test_util_apks if not os.path.isfile(apk)]
+        if missing:
+            raise AndroidE2EError(f"missing {', '.join(missing)}; run `make android-host`")
         on_log(f"[android-e2e] waiting for the host emulator (one Android E2E run at a time)")
-        with AndroidE2E._lock:
-            emu = self._boot(on_log)
+        with self._emulator_turn(lease):
+            emu = self._boot(on_log, lease)
             stop = threading.Event()
             follower = None
             try:
-                for apk in ("app.apk", "test.apk"):
-                    self._adb("install", "-r", "-t", os.path.join(handoff_dir, apk), timeout=300)
+                suite = [os.path.join(handoff_dir, apk) for apk in ("app.apk", "test.apk")]
+                for apk in suite + self.test_util_apks:
+                    self._adb("install", "-r", "-t", apk, timeout=300)
                 runner = self._instrumentation(package)
                 on_log(f"[android-e2e] {runner} · flavor={spec.get('flavor')} "
                        f"tags={spec.get('tags') or 'all'}")
@@ -151,7 +190,7 @@ class AndroidE2E:
                 follower = threading.Thread(target=self._follow_logcat,
                                             args=(artifact_dir, on_log, stop), daemon=True)
                 follower.start()
-                return self._instrument(runner, on_log)
+                return self._instrument(runner, on_log, lease)
             finally:
                 stop.set()
                 subprocess.run([self.adb, "-s", self.serial, "emu", "kill"],
@@ -163,13 +202,12 @@ class AndroidE2E:
                 if follower:
                     follower.join(timeout=5)
 
-    def _instrument(self, runner: str, on_log) -> list:
+    def _instrument(self, runner: str, on_log, lease) -> list:
         """`am instrument -r` exits 0 even when tests fail; results come from its status lines."""
         proc = subprocess.Popen(
-            [self.adb, "-s", self.serial, "shell", "am", "instrument", "-w", "-r", runner],
+            [self.adb, "-s", self.serial, "shell", _ORCHESTRATOR_COMMAND.format(runner=runner)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-        timer = threading.Timer(self.test_timeout, proc.kill)
-        timer.start()
+        threading.Thread(target=self._kill_when_lease_ends, args=(proc, lease), daemon=True).start()
         failures, status, stack, in_stack, crashed = [], {}, [], False, False
         counts = {"✅": 0, "❌": 0, "⏩": 0}
         try:
@@ -207,8 +245,8 @@ class AndroidE2E:
                 elif line.startswith("INSTRUMENTATION_RESULT: shortMsg="):
                     on_log(line)
         finally:
-            timer.cancel()
             proc.wait()
+        lease.check()
 
         on_log(f"[android-e2e] passed {counts['✅']}, failed {counts['❌']}, "
                f"skipped {counts['⏩']}")

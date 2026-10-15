@@ -3,7 +3,8 @@
 # mobile-app Makefile — which owns the ENTIRE build + publish (fastlane, flavors, signing, stores).
 # The agent only does: git checkout -> make init -> make <make_target>.
 # Vault-rendered creds are exported as env so the repo's make/fastlane can authenticate.
-# Emits "@@STATUS {json}" lines on stdout — the host forwards them to RabbitMQ.
+# Reports progress as "@@STATUS {json}" lines on stdout and its outcome as the exit code plus
+# out/result.json; the host turns those into the job's status on RabbitMQ.
 set -uo pipefail
 
 MOUNT="/Volumes/My Shared Files/io"
@@ -55,14 +56,10 @@ import json,sys
 json.dump({"status":"failed","phase":sys.argv[2],"progress":float(sys.argv[3]),
            "message":sys.argv[4]}, open(sys.argv[1],"w"))
 PY
-  emit failed "$ph" "$pr" "$@"
-  # include the log tail for the host to attach to the status
-  tail -c 4000 "$BUILD_LOG" 2>/dev/null
   exit 1
 }
-# tee to stdout AND the file: stdout is what the host SSH captures and streams to Argo (line-level
-# logs), build.log is kept in the VM's out/ (host-side shared dir) for the failure tail. pipefail
-# (set above) makes the pipeline return the command's exit, not tee's, so `run x || fail` still works.
+# tee to stdout (streamed to Argo by the host) AND build.log in out/ (the host-side share).
+# pipefail (set above) makes `run x || fail` see the command's exit, not tee's.
 run() { echo "\$ $*" | tee -a "$BUILD_LOG"; "$@" 2>&1 | tee -a "$BUILD_LOG"; }
 
 # ---- job --------------------------------------------------------------------
@@ -129,4 +126,3 @@ run make "$MAKE_TARGET" || fail "$MAKE_TARGET" 0.60 "make $MAKE_TARGET failed"
 
 # ---- done -------------------------------------------------------------------
 python3 -c "import json;json.dump({'status':'succeeded','phase':'done','progress':1.0},open('$OUT/result.json','w'))"
-emit succeeded done 1.0 "make $MAKE_TARGET complete"

@@ -10,6 +10,7 @@ TestFlight / Play / Firebase, then destroys the VM. Build status is streamed bac
 The host talks to RabbitMQ; the VM does the building. See config.example.yaml and README.md.
 """
 import base64
+import contextlib
 import json
 import os
 import signal
@@ -41,16 +42,67 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+class JobLost(Exception):
+    """The channel that delivered the job closed, so RabbitMQ has requeued it."""
+
+
+class Lease:
+    """The agent's hold on one delivered job: valid while the delivering channel is open and the
+    job is within its time bound (counted from delivery). Everything about the job goes through
+    that channel, so an execution that lost it can neither ack another job nor end a dispatch."""
+
+    def __init__(self, channel, delivery_tag: int, max_seconds: int):
+        self.channel = channel
+        self.delivery_tag = delivery_tag
+        self.max_seconds = max_seconds
+        self._deadline = time.monotonic() + max_seconds
+
+    def check(self) -> None:
+        if not self.channel.is_open:
+            raise JobLost()
+        if time.monotonic() > self._deadline:
+            raise BuildError(f"job exceeded {self.max_seconds}s")
+
+    def run_on_channel(self, fn, on_lost=lambda: None) -> None:
+        """Runs fn(channel) on the connection's IO thread if the channel is still open, else
+        on_lost()."""
+        def guarded():
+            if self.channel.is_open:
+                fn(self.channel)
+            else:
+                on_lost()
+        try:
+            self.channel.connection.add_callback_threadsafe(guarded)
+        except pika.exceptions.ConnectionWrongStateError:
+            on_lost()
+
+
+def _ack(channel, delivery_tag):
+    channel.basic_ack(delivery_tag)
+
+
+def _requeue(channel, delivery_tag):
+    channel.basic_nack(delivery_tag, requeue=True)
+
+
+def _dead_letter(channel, delivery_tag):
+    channel.basic_nack(delivery_tag, requeue=False)
+
+
 class Agent:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.name = cfg["agent"]["name"]
+        self.max_job_seconds = int(cfg["agent"].get("max_job_seconds", 5400))
+        self.prefetch = int(cfg["agent"].get("prefetch", 1))
         self.status_exchange = cfg["queues"]["status_exchange"]
         self.jobs_queue = cfg["queues"]["jobs"]
-        self.runner = TartRunner(cfg)
+        self.runner = TartRunner(cfg, vm_slots=self.prefetch)
         self._stopping = threading.Event()
         self._conn = None
         self._channel = None
+        self._executions: dict[str, list[threading.Thread]] = {}
+        self._executions_lock = threading.Lock()
 
     # ---- connection ----------------------------------------------------------
     def _connect(self):
@@ -78,94 +130,127 @@ class Agent:
         # exchange is created by the cluster session; declare passively so we fail loudly if missing
         self._channel.exchange_declare(self.status_exchange, exchange_type="direct",
                                        durable=True, passive=True)
-        self._channel.basic_qos(prefetch_count=int(self.cfg["agent"].get("prefetch", 1)))
+        self._channel.basic_qos(prefetch_count=self.prefetch)
         self._channel.basic_consume(self.jobs_queue, self._on_message, auto_ack=False)
 
-    # ---- status publishing (thread-safe) ------------------------------------
-    def publish_status(self, job_id: str, **fields):
-        body = {"job_id": job_id, "agent": self.name,
-                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **fields}
-        payload = json.dumps(body)
+    # ---- messages about a job (thread-safe; only through its delivering channel) ----------
+    def _status_body(self, job_id: str, fields: dict) -> str:
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return json.dumps({"job_id": job_id, "agent": self.name, "ts": ts, **fields})
 
-        def _do():
+    def _send(self, channel, job_id: str, payload: str) -> None:
+        channel.basic_publish(
+            self.status_exchange, routing_key=job_id, body=payload,
+            properties=pika.BasicProperties(delivery_mode=2, content_type="application/json"))
+
+    def _publish(self, lease: Lease, job_id: str, **fields):
+        payload = self._status_body(job_id, fields)
+
+        def publish(channel):
             try:
-                self._channel.basic_publish(
-                    self.status_exchange, routing_key=job_id, body=payload,
-                    properties=pika.BasicProperties(delivery_mode=2, content_type="application/json"))
+                self._send(channel, job_id, payload)
             except Exception as e:  # noqa: BLE001
                 log(f"WARN: failed to publish status for {job_id}: {e}")
 
-        # marshal onto the connection's IO thread
-        self._conn.add_callback_threadsafe(_do)
+        lease.run_on_channel(publish)
 
-    def _publish_artifact(self, job_id, name, data, content_type, skipped):
+    def _publish_artifact(self, lease, job_id, name, data, content_type, skipped):
         # Contract: {"type":"artifact","name","content_type","encoding":"base64","data"} on
         # mobile.status; the dispatcher stores them as the Argo node's output artifacts.
         if skipped:
-            self.publish_status(job_id, type="log", lines=[f"[agent] artifact {name} {skipped}"])
+            self._publish(lease, job_id, type="log", lines=[f"[agent] artifact {name} {skipped}"])
             return
-        self.publish_status(job_id, type="artifact", name=name, content_type=content_type,
-                            encoding="base64", data=base64.b64encode(data).decode("ascii"))
-        log(f"job {job_id}: shipped artifact {name} ({len(data)} bytes)")
+        log(f"job {job_id}: sending artifact {name} ({len(data)} bytes)")
+        self._publish(lease, job_id, type="artifact", name=name, content_type=content_type,
+                      encoding="base64", data=base64.b64encode(data).decode("ascii"))
 
-    def _ack(self, delivery_tag: int, requeue_on_fail: bool = False, nack: bool = False):
-        def _do():
+    def _finish(self, lease: Lease, job_id: str, settle, **fields):
+        """Publishes the terminal status and settles the delivery in one IO-thread step, so neither
+        happens once the delivering channel has closed."""
+        payload = self._status_body(job_id, fields)
+
+        def finish(channel):
             try:
-                if nack:
-                    self._channel.basic_nack(delivery_tag, requeue=requeue_on_fail)
-                else:
-                    self._channel.basic_ack(delivery_tag)
+                self._send(channel, job_id, payload)
+                settle(channel, lease.delivery_tag)
             except Exception as e:  # noqa: BLE001
-                log(f"WARN: ack/nack failed (tag {delivery_tag}): {e}")
-        self._conn.add_callback_threadsafe(_do)
+                log(f"WARN: terminal status/ack failed for {job_id}: {e}")
+
+        lease.run_on_channel(finish, on_lost=lambda: log(
+            f"job {job_id}: delivery requeued before the outcome could be reported"))
 
     # ---- message handling ----------------------------------------------------
     def _on_message(self, ch, method, props, body):
+        lease = Lease(ch, method.delivery_tag, self.max_job_seconds)
         # Run each job on its own thread so long builds never block AMQP heartbeats.
-        t = threading.Thread(target=self._process, args=(body, method.delivery_tag), daemon=True)
-        t.start()
+        threading.Thread(target=self._process, args=(body, lease), daemon=True).start()
 
-    def _process(self, body: bytes, delivery_tag: int):
+    def _process(self, body: bytes, lease: Lease):
         try:
             job = json.loads(body)
         except Exception as e:  # noqa: BLE001
             log(f"ERROR: undecodable job message, dead-lettering: {e}")
-            self._ack(delivery_tag, requeue_on_fail=False, nack=True)  # -> DLX
+            lease.run_on_channel(lambda ch: _dead_letter(ch, lease.delivery_tag))
             return
 
         job_id = job.get("job_id", "unknown")
         log(f"picked up job {job_id} make_target={job.get('make_target')} ref={job.get('ref')}")
-        self.publish_status(job_id, state="accepted", phase="checkout", progress=0.0,
-                            message=f"accepted by {self.name}")
+        self._execute(job_id, job, lease)
 
+    @contextlib.contextmanager
+    def _sole_execution(self, job_id: str, lease: Lease):
+        """One execution of a job at a time on this Mac: waits, polling the lease, until the job's
+        earlier executions (whose deliveries were requeued) have stopped."""
+        me = threading.current_thread()
+        with self._executions_lock:
+            earlier = list(self._executions.setdefault(job_id, []))
+            self._executions[job_id].append(me)
         try:
-            result = self.runner.run(
-                job,
-                status_cb=lambda **kw: self.publish_status(job_id, **kw),
-                should_stop=self._stopping.is_set,
-                # raw build output → Argo node logs (batched by the runner). The coarse
-                # phase/progress status messages above still drive the headline.
-                log_cb=lambda lines: self.publish_status(job_id, type="log", lines=lines),
-                artifact_cb=lambda name, data, content_type, skipped: self._publish_artifact(
-                    job_id, name, data, content_type, skipped),
-            )
-            self.publish_status(job_id, state="succeeded", phase="done", progress=1.0,
-                                platform=None, message="build + publish complete",
-                                artifacts=result.get("artifacts", {}),
-                                log_tail=result.get("log_tail", ""))
-            self._ack(delivery_tag)
-            log(f"job {job_id} SUCCEEDED")
+            if earlier:
+                log(f"job {job_id}: waiting for its earlier execution to stop")
+            for thread in earlier:
+                while thread.is_alive():
+                    lease.check()
+                    thread.join(timeout=3)
+            yield
+        finally:
+            with self._executions_lock:
+                self._executions[job_id].remove(me)
+                if not self._executions[job_id]:
+                    del self._executions[job_id]
+
+    def _execute(self, job_id: str, job: dict, lease: Lease):
+        try:
+            with self._sole_execution(job_id, lease):
+                self._publish(lease, job_id, state="accepted", phase="checkout", progress=0.0,
+                              message=f"accepted by {self.name}")
+                result = self.runner.run(
+                    job, lease,
+                    status_cb=lambda **kw: self._publish(lease, job_id, **kw),
+                    # raw build output → Argo node logs (batched by the runner). The coarse
+                    # phase/progress status messages above still drive the headline.
+                    log_cb=lambda lines: self._publish(lease, job_id, type="log", lines=lines),
+                    artifact_cb=lambda name, data, content_type, skipped: self._publish_artifact(
+                        lease, job_id, name, data, content_type, skipped),
+                )
+        except JobLost:
+            log(f"job {job_id}: delivery requeued (channel closed); stopped this execution")
         except BuildError as e:
             # a genuine build/publish failure — do not requeue (would just fail again)
-            self.publish_status(job_id, state="failed", phase=e.phase, progress=e.progress,
-                                platform=e.platform, message=str(e), log_tail=e.log_tail)
-            self._ack(delivery_tag)
+            self._finish(lease, job_id, _ack, state="failed", phase=e.phase,
+                         progress=e.progress, platform=e.platform, message=str(e),
+                         log_tail=e.log_tail)
             log(f"job {job_id} FAILED: {e}")
-        except Exception as e:  # noqa: BLE001 — infra/transient error: requeue once via redelivery
-            self.publish_status(job_id, state="failed", phase="infra", progress=0.0,
-                                message=f"agent/infra error: {e}")
-            self._ack(delivery_tag, requeue_on_fail=True, nack=True)
+        except Exception as e:  # noqa: BLE001 — infra/transient error: the broker redelivers it
+            self._finish(lease, job_id, _requeue, state="failed", phase="infra", progress=0.0,
+                         message=f"agent/infra error: {e}")
             log(f"job {job_id} infra error (requeued): {e}")
+        else:
+            self._finish(lease, job_id, _ack, state="succeeded", phase="done", progress=1.0,
+                         platform=None, message="build + publish complete",
+                         artifacts=result.get("artifacts", {}),
+                         log_tail=result.get("log_tail", ""))
+            log(f"job {job_id} SUCCEEDED")
 
     # ---- lifecycle -----------------------------------------------------------
     def run_forever(self):

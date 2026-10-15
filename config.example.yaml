@@ -22,6 +22,9 @@ agent:
   workspace: __WORKSPACE__
   keep_jobs: 5                     # how many recent per-job dirs (logs/artifacts) to retain
   prefetch: 2                      # concurrent builds = concurrent VMs (Apple's hard cap is 2/host)
+  # Whole-job bound from pickup: VM build + host Android E2E + waits for a VM/emulator. The broker's
+  # consumer_timeout (platform rabbitmqcluster.yaml) must stay above it, or jobs are requeued mid-run.
+  max_job_seconds: 5400
 
 vm:
   tart_bin: /opt/homebrew/bin/tart
@@ -29,7 +32,6 @@ vm:
   cpus: 5                          # 2 concurrent VMs -> 10 vCPU, leaves headroom on a 12-core host
   memory_gb: 18                    # 2 concurrent VMs -> 36 GB, leaves ~12 GB on a 48 GB host
   boot_timeout_sec: 180           # wait for VM IP + SSH after boot
-  max_job_seconds: 3600           # hard-kill a build (VM torn down) after this
   ssh_user: admin                 # Cirrus macOS images default to admin/admin
   ssh_password: admin
 
@@ -40,7 +42,6 @@ android_e2e:
   avd: cgh-e2e
   port: 5580                      # emulator-5580; one Android E2E run at a time per host
   boot_timeout_sec: 300
-  test_timeout_sec: 3000
 
 # Files a job leaves in its out/artifacts/ (E2E failure screenshots) are sent back over
 # RabbitMQ and stored by Argo as the run's artifacts. Capped so a runaway test cannot flood it.

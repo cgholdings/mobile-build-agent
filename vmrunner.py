@@ -4,7 +4,7 @@ TartRunner — boots an ephemeral macOS VM per job, runs the build inside it, te
 Host responsibilities (here):
   * clone the base image to a throwaway VM
   * stage job context + publish secrets into a shared dir mounted into the VM
-  * boot, SSH in, run vm-build.sh, stream its @@STATUS lines back to the caller
+  * boot, SSH in, run vm-build.sh, stream its output and @@STATUS progress back to the caller
   * for Android E2E jobs, run the APKs the VM built on a host emulator (android_e2e.py) —
     macOS VMs cannot nest the hypervisor the emulator needs
   * collect out/result.json, ship out/artifacts/* (E2E failure screenshots) back to the caller,
@@ -16,7 +16,9 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
+import uuid
 
 import paramiko
 
@@ -25,6 +27,8 @@ from android_e2e import AndroidE2E, AndroidE2EError
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUEST_MOUNT = "/Volumes/My Shared Files/io"   # where Tart mounts our --dir=io:...
 ARTIFACT_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".txt": "text/plain"}
+# The guest runs repository code, so it reports progress only; the terminal status is the agent's.
+GUEST_STATES = ("building", "publishing")
 
 
 class BuildError(Exception):
@@ -37,7 +41,7 @@ class BuildError(Exception):
 
 
 class TartRunner:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, vm_slots: int):
         self.cfg = cfg
         v = cfg["vm"]
         self.tart = v.get("tart_bin", "tart")
@@ -45,11 +49,14 @@ class TartRunner:
         self.cpus = int(v.get("cpus", 6))
         self.mem = int(v.get("memory_gb", 20))
         self.boot_timeout = int(v.get("boot_timeout_sec", 180))
-        self.max_seconds = int(v.get("max_job_seconds", 3600))
         self.ssh_user = v.get("ssh_user", "admin")
         self.ssh_pass = v.get("ssh_password", "admin")
         self.workspace = cfg["agent"]["workspace"]
         self.keep_jobs = int(cfg["agent"].get("keep_jobs", 5))
+        # Freed after VM teardown, not on ack: a lost channel frees deliveries before their VMs.
+        self._vm_slots = threading.Semaphore(vm_slots)
+        self._active_dirs = set()
+        self._active_dirs_lock = threading.Lock()
         self.android_e2e = AndroidE2E(cfg)
         a = cfg.get("artifacts") or {}
         self.max_artifacts = int(a.get("max_files", 10))
@@ -60,9 +67,16 @@ class TartRunner:
         return subprocess.run([self.tart, *args], check=check,
                               capture_output=capture, text=True)
 
-    def _vm_ip(self, vm: str) -> str:
+    def _take_vm_slot(self, lease) -> None:
+        while True:
+            lease.check()
+            if self._vm_slots.acquire(timeout=3):
+                return
+
+    def _vm_ip(self, vm: str, lease) -> str:
         deadline = time.time() + self.boot_timeout
         while time.time() < deadline:
+            lease.check()
             r = self._tart("ip", vm, check=False, capture=True)
             ip = (r.stdout or "").strip()
             if r.returncode == 0 and ip:
@@ -70,10 +84,11 @@ class TartRunner:
             time.sleep(3)
         raise BuildError(f"VM {vm} did not get an IP within {self.boot_timeout}s", phase="boot")
 
-    def _ssh(self, ip: str) -> paramiko.SSHClient:
+    def _ssh(self, ip: str, lease) -> paramiko.SSHClient:
         deadline = time.time() + self.boot_timeout
         last = None
         while time.time() < deadline:
+            lease.check()
             try:
                 cli = paramiko.SSHClient()
                 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -125,11 +140,14 @@ class TartRunner:
 
     def _prune(self):
         try:
+            with self._active_dirs_lock:
+                active = set(self._active_dirs)
             jobs = sorted(
                 (os.path.join(self.workspace, d) for d in os.listdir(self.workspace)
                  if os.path.isdir(os.path.join(self.workspace, d))),
                 key=os.path.getmtime, reverse=True)
-            for old in jobs[self.keep_jobs:]:
+            finished = [d for d in jobs if d not in active]
+            for old in finished[self.keep_jobs:]:
                 shutil.rmtree(old, ignore_errors=True)
         except Exception:  # noqa: BLE001
             pass
@@ -160,20 +178,25 @@ class TartRunner:
             shipped += 1
 
     # -- main entry ------------------------------------------------------------
-    def run(self, job: dict, status_cb, should_stop, log_cb=None, artifact_cb=None) -> dict:
+    def run(self, job: dict, lease, status_cb, log_cb=None, artifact_cb=None) -> dict:
+        """Runs one execution of the job. Raises BuildError for a failed job, and lets
+        lease.check()'s JobLost through when the job's delivery is lost."""
         job_id = job["job_id"]
-        vm = f"build-{job_id[:8]}"
-        jobdir = os.path.join(self.workspace, job_id)
+        execution = uuid.uuid4().hex[:6]
+        vm = f"build-{job_id[:8]}-{execution}"
+        jobdir = os.path.join(self.workspace, f"{job_id}.{execution}")
+        with self._active_dirs_lock:
+            self._active_dirs.add(jobdir)
         os.makedirs(jobdir, exist_ok=True)
         log_tail: list[str] = []
         run_proc = None
         stream_fp = None
-        vm_up = [False]
+        holds_vm_slot = [False]
 
         def teardown_vm():
-            if not vm_up[0]:
+            if not holds_vm_slot[0]:
                 return
-            vm_up[0] = False
+            holds_vm_slot[0] = False
             try:
                 if run_proc:
                     run_proc.terminate()
@@ -182,6 +205,7 @@ class TartRunner:
                 self._tart("delete", vm, check=False)
             except Exception:  # noqa: BLE001
                 pass
+            self._vm_slots.release()
 
         def keep_tail(line):
             log_tail.append(line)
@@ -225,31 +249,27 @@ class TartRunner:
                 stream_fp = open(os.path.join(jobdir, "out", "stream.log"), "w", buffering=1)
             except OSError:
                 stream_fp = None
+            self._take_vm_slot(lease)
+            holds_vm_slot[0] = True
             status_cb(state="building", phase="boot", progress=0.02, message=f"cloning VM {vm}")
             self._tart("clone", self.base, vm)
-            vm_up[0] = True
             self._tart("set", vm, "--cpu", str(self.cpus), "--memory", str(self.mem * 1024))
 
             run_proc = subprocess.Popen(
                 [self.tart, "run", vm, "--no-graphics", f"--dir=io:{jobdir}"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            ip = self._vm_ip(vm)
+            ip = self._vm_ip(vm, lease)
             status_cb(state="building", phase="boot", progress=0.05, message=f"VM up at {ip}")
-            cli = self._ssh(ip)
+            cli = self._ssh(ip, lease)
 
             # run the build script inside the VM; stream its output
             cmd = f'bash "{GUEST_MOUNT}/in/vm-build.sh" 2>&1'
             chan = cli.get_transport().open_session()
             chan.exec_command(cmd)
-            deadline = time.time() + self.max_seconds
             buf = ""
             while True:
-                if should_stop():
-                    raise BuildError("agent shutting down", phase="build")
-                if time.time() > deadline:
-                    raise BuildError(f"build exceeded {self.max_seconds}s", phase="build",
-                                     log_tail="\n".join(log_tail))
+                lease.check()
                 if chan.recv_ready():
                     buf += chan.recv(65536).decode("utf-8", "replace")
                     while "\n" in buf:
@@ -275,8 +295,7 @@ class TartRunner:
                 raise BuildError(result.get("message", f"build exited {rc}"),
                                  phase=result.get("phase", "build"),
                                  platform=result.get("platform"),
-                                 progress=result.get("progress", 0.5),
-                                 log_tail="\n".join(log_tail[-80:]))
+                                 progress=result.get("progress", 0.5))
 
             handoff = os.path.join(jobdir, "out", "android-e2e")
             if os.path.exists(os.path.join(handoff, "run.json")):
@@ -286,11 +305,10 @@ class TartRunner:
                           message="running Android E2E on the host emulator")
                 try:
                     failures = self.android_e2e.run(
-                        handoff, os.path.join(jobdir, "out", "artifacts"), on_log)
+                        handoff, os.path.join(jobdir, "out", "artifacts"), on_log, lease)
                 except AndroidE2EError as e:
                     raise BuildError(f"Android E2E could not run: {e}", phase="e2e",
-                                     platform="android", progress=0.8,
-                                     log_tail="\n".join(log_tail[-80:])) from e
+                                     platform="android", progress=0.8) from e
                 finally:
                     flush_logs(force=True)
                 if failures:
@@ -306,12 +324,14 @@ class TartRunner:
                         on_log(line)
                     flush_logs(force=True)
                     raise BuildError(f"Android E2E: {len(failures)} test(s) failed", phase="e2e",
-                                     platform="android", progress=0.9,
-                                     log_tail="\n".join(log_tail[-80:]))
+                                     platform="android", progress=0.9)
 
             return {"artifacts": result.get("artifacts", {}),
                     "log_tail": "\n".join(log_tail[-40:])}
 
+        except BuildError as e:
+            e.log_tail = e.log_tail or "\n".join(log_tail[-80:])
+            raise
         finally:
             try:
                 flush_logs(force=True)
@@ -328,6 +348,8 @@ class TartRunner:
                 except Exception:  # noqa: BLE001
                     pass
             teardown_vm()
+            with self._active_dirs_lock:
+                self._active_dirs.discard(jobdir)
             self._prune()
 
     @staticmethod
@@ -337,8 +359,11 @@ class TartRunner:
             return
         if line.startswith("@@STATUS "):
             try:
-                status_cb(**json.loads(line[len("@@STATUS "):]))
-                return
+                s = json.loads(line[len("@@STATUS "):])
+                if s["state"] in GUEST_STATES:
+                    status_cb(state=s["state"], phase=s["phase"], progress=float(s["progress"]),
+                              message=s["message"])
+                    return
             except Exception:  # noqa: BLE001
                 pass
         on_log(line)
